@@ -1,0 +1,140 @@
+---
+title: "Contrôle synthétique"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Contexte
+
+Une seule région a reçu la pub, on a peu d’unités de comparaison.  
+La méthode du contrôle synthétique consiste à construire artificiellement un groupe de contrôle en combinant plusieurs autres régions de façon à  
+matcher la trajectoire pré-campagne de la région test.  
+En d’autres termes, on cherche des poids pour que la combinaison de régions non exposées reproduise au mieux les ventes de la région A
+avant l’intervention.  
+Puis on compare l’évolution après campagne entre la région A et ce "jumeau synthétique".
+On peut illustrer cela sur un exemple fictif : imaginons 10 régions sans pub, dont on ajustera les poids.
+
+
+```{r}
+library(Synth)
+set.seed(123)
+
+# Création des régions et périodes
+regions <- c("A", "B", "C", "D")
+periodes <- 1:15
+
+# Création du data.frame panel
+df_panel <- expand.grid(region = regions, periode = periodes)
+df_panel <- df_panel[order(df_panel$region, df_panel$periode), ]
+
+# Conversion de region en character (clé pour éviter l’erreur)
+df_panel$region <- as.character(df_panel$region)
+
+# ID numérique pour Synth
+df_panel$region_id <- as.numeric(as.factor(df_panel$region))
+
+# Simulation des ventes
+effets_region <- c("A" = 0, "B" = 1, "C" = -1, "D" = 0.5)
+df_panel$trend <- df_panel$periode * 2 + rnorm(nrow(df_panel), sd = 1)
+df_panel$effet_region <- effets_region[df_panel$region]
+df_panel$ventes <- df_panel$trend + df_panel$effet_region
+
+# Ajout de l'effet traitement à partir de la période 11 pour région A
+df_panel$ventes[df_panel$region == "A" & df_panel$periode >= 11] <-
+  df_panel$ventes[df_panel$region == "A" & df_panel$periode >= 11] + 5
+
+
+
+```
+
+
+```{r}
+library(ggplot2)
+
+# S'assurer que la colonne région est factor pour l’ordre des couleurs
+df_panel$region <- as.factor(df_panel$region)
+
+# Graphique
+ggplot(df_panel, aes(x = periode, y = ventes, color = region)) +
+  geom_line(size = 1.2) +
+  geom_vline(xintercept = 11, linetype = "dashed", color = "black") +
+  labs(
+    title = "Évolution des ventes par région",
+    subtitle = "Traitement appliqué à la période 11 pour la région A",
+    x = "Période",
+    y = "Ventes",
+    color = "Région"
+  ) +
+  theme_minimal(base_size = 14)
+
+```
+
+
+```{r}
+
+# Préparation des données pour Synth
+dataprep.out <- dataprep(
+  foo = df_panel,
+  predictors = "ventes",
+  predictors.op = "mean",
+  time.predictors.prior = 1:10,
+  dependent = "ventes",
+  unit.variable = "region_id",           # doit être numérique
+  unit.names.variable = "region",        # doit être character !
+  time.variable = "periode",
+  treatment.identifier = df_panel$region_id[df_panel$region == "A"][1],
+  controls.identifier = unique(df_panel$region_id[df_panel$region != "A"]),
+  time.optimize.ssr = 1:10,
+  time.plot = 1:15
+)
+
+# Application de Synth
+synth.out <- synth(dataprep.out)
+synth.out$solution.w # poids des régions contrôles
+path.plot(synth.out, dataprep.out)
+```
+
+
+**Résultat typique :** 
+Avant la campagne (périodes 1-10), la courbe des ventes de la région A et celle du
+contrôle synthétique coïncident pratiquement (validation du matching).  
+Après lancement de la pub en A (période 11+), on observe par exemple que les ventes de A dépassent la courbe synthétique – la
+différence représente l’effet causal estimé .  
+On peut calculer un impact cumulé, etc.  
+Il s'agit, ici, de fournir un contrefactuel crédible quand on a peu d’unités de comparaison en combinant l’information de plusieurs sources.  
+Cette méthode a été popularisée dans l’évaluation de politiques (ex: impact d’une loi dans un État) et adaptée au marketing pour les
+campagnes géo-localisées .  
+Elle “va au-delà d’un simple A/B test” en exploitant la structure temporelle des données.  
+Facebook/Meta a par exemple développé l’outil GeoLift pour faciliter ce genre d’analyses géographiques .
+**Le contrôle synthétique repose sur l’hypothèse de tendance parallèle des ventes en l’absence d’intervention** mais la renforce en ajustant finement les poids pour coller aux tendances préalables. Il faut suffisamment de données pré-campagne et de régions
+comparables disponibles.  
+Si la région test est trop unique, la méthode échoue (pas de bon synthétique).  
+Dans ce cas on considérerait d’autres approches (modèles de séries temporelles bayésiens, etc.).
+
+
+## Discussion : hypothèses, limites, interprétation
+Hypothèse clé : en l’absence de pub, la région test aurait suivi la même trajectoire que le contrôle synthétique. C’est non vérifiable a posteriori, mais on le rend plausible en ajustant bien sur l’historique pré-intervention. La qualité du synthétique (erreur précampagne faible) renforce la confiance .  
+Il faut aussi supposer qu’aucun autre événement majeur n’a
+affecté différemment la région A pendant la campagne (sinon l’effet attribué peut être dû à autre chose)
+
+Malgré ces précautions, l’estimation reste une approximation.  
+On peut la renforcer par des techniques complémentaires : par ex., effectuer un test “placebo” en appliquant la même méthode à une région où
+il n’y a pas eu de campagne pour vérifier qu’on n’y voit pas d’effet artificiel, ou permuter la date de l’intervention pour voir si un effet apparaît alors qu’il ne devrait pas (ce sont des falsification tests usuels en synthétique).
+
+
+## Portée managériale : 
+Ces méthodes quasi-expérimentales permettent aux marketeurs d’estimer le ROI
+de campagnes qu’on n’a pas pu tester de façon randomisée. En comparant avec prudence, on obtient
+une idée de l’uplift causal dû à la pub.  
+On peut alors décider d’étendre, d’ajuster la campagne, ou de la stopper si l’impact est nul.  
+Toutefois, communiquer ces résultats nécessite de les expliquer avec pédagogie car ils reposent sur des modèles statistiques plus complexes qu’un A/B test standard.  
+En résumé, ce cas met en oeuvre des outils pour s’approcher d’une causalité dans des conditions non expérimentales : propensity score matching pour équilibrer des groupes a posteriori et synthetic control pour analyser un traitement à faible échelle .  
+Ces approches illustrent le recours aux méthodes quasi-expérimentales en marketing lorsque le randomisé pur est difficile .
+
+```{r}
+
+```
+
